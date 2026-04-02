@@ -72,7 +72,7 @@ jobs:
           )
           msg['Subject'] = '[Redash Sync] VPN OTP를 입력해주세요'
           msg['From'] = os.environ['GMAIL_USER']
-          msg['To'] = os.environ['WORK_EMAIL']
+          msg['To'] = os.environ['GMAIL_USER']  # 테스트: Gmail로 발송
 
           with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
               smtp.login(os.environ['GMAIL_USER'], os.environ['GMAIL_APP_PASSWORD'])
