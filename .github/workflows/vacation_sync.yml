@@ -1,0 +1,188 @@
+name: Vacation Redash Sync
+
+on:
+  schedule:
+    - cron: '0 2 * * 1-5'  # 매일 평일 11:00 KST (= 02:00 UTC)
+  workflow_dispatch:         # 수동 테스트용
+
+jobs:
+  check-vacation:
+    runs-on: ubuntu-latest
+    outputs:
+      is_vacation: ${{ steps.check.outputs.is_vacation }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 휴가 여부 확인
+        id: check
+        run: |
+          python3 - <<'EOF'
+          import json
+          from datetime import date
+
+          with open('vacation.json') as f:
+              periods = json.load(f)
+
+          today = date.today().isoformat()
+          is_vacation = any(p['start'] <= today <= p['end'] for p in periods)
+          print(f"오늘 날짜: {today}")
+          print(f"휴가 여부: {is_vacation}")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'is_vacation={str(is_vacation).lower()}\n')
+          EOF
+        env:
+          PYTHONPATH: .
+
+  sync:
+    needs: check-vacation
+    if: needs.check-vacation.outputs.is_vacation == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 패키지 설치
+        run: |
+          pip install -r requirements.txt
+          sudo apt-get install -y openconnect
+
+      - name: 인증 파일 복원
+        run: |
+          echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
+          echo '${{ secrets.GOOGLE_TOKEN }}' > token.json
+
+      - name: OTP 요청 이메일 발송
+        run: |
+          python3 - <<'EOF'
+          import smtplib, os
+          from email.mime.text import MIMEText
+
+          msg = MIMEText(
+              '안녕하세요!\n\n'
+              'Redash 자동 동기화를 위해 VPN OTP가 필요합니다.\n\n'
+              '📌 OTP 6자리 숫자만 이 메일에 답장해주세요.\n\n'
+              '⏰ 5분 내로 답장이 없으면 오늘은 건너뜁니다.',
+              'plain', 'utf-8'
+          )
+          msg['Subject'] = '[Redash Sync] VPN OTP를 입력해주세요'
+          msg['From'] = os.environ['GMAIL_USER']
+          msg['To'] = os.environ['WORK_EMAIL']
+
+          with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+              smtp.login(os.environ['GMAIL_USER'], os.environ['GMAIL_APP_PASSWORD'])
+              smtp.send_message(msg)
+          print('이메일 발송 완료')
+          EOF
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          WORK_EMAIL: ${{ secrets.WORK_EMAIL }}
+
+      - name: OTP 답장 대기 (최대 5분)
+        id: get_otp
+        run: |
+          python3 - <<'EOF'
+          import imaplib, email, time, os, re
+
+          gmail_user = os.environ['GMAIL_USER']
+          gmail_pass = os.environ['GMAIL_APP_PASSWORD']
+
+          mail = imaplib.IMAP4_SSL('imap.gmail.com')
+          mail.login(gmail_user, gmail_pass)
+
+          otp = None
+          for attempt in range(30):  # 10초 × 30 = 5분
+              time.sleep(10)
+              mail.select('inbox')
+              _, data = mail.search(None, 'UNSEEN')
+              for num in data[0].split():
+                  _, msg_data = mail.fetch(num, '(RFC822)')
+                  msg = email.message_from_bytes(msg_data[0][1])
+                  sender = msg.get('From', '')
+                  if 'myrealtrip.com' not in sender:
+                      continue
+                  body = ''
+                  if msg.is_multipart():
+                      for part in msg.walk():
+                          if part.get_content_type() == 'text/plain':
+                              body = part.get_payload(decode=True).decode(errors='ignore')
+                              break
+                  else:
+                      body = msg.get_payload(decode=True).decode(errors='ignore')
+
+                  match = re.search(r'\b(\d{6})\b', body)
+                  if match:
+                      otp = match.group(1)
+                      mail.store(num, '+FLAGS', '\\Seen')
+                      break
+
+              if otp:
+                  print(f'OTP 수신 완료 (시도 {attempt+1}회)')
+                  break
+              print(f'대기 중... ({attempt+1}/30)')
+
+          mail.logout()
+
+          if not otp:
+              print('OTP를 받지 못했습니다. 오늘은 건너뜁니다.')
+              exit(1)
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'otp={otp}\n')
+          EOF
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+
+      - name: VPN 연결
+        run: |
+          printf '%s\n%s\n' '${{ secrets.VPN_PASSWORD }}' '${{ steps.get_otp.outputs.otp }}' | \
+            sudo openconnect --protocol=pulse mrt-vpn.myrealtrip.com \
+            --user='${{ secrets.VPN_USERNAME }}' \
+            --passwd-on-stdin \
+            --background \
+            --pid-file=/tmp/vpn.pid \
+            --no-dtls
+          sleep 5
+          echo "VPN 연결 완료"
+
+      - name: sync.py 실행
+        run: python3 -u sync.py
+
+      - name: VPN 해제
+        if: always()
+        run: |
+          if [ -f /tmp/vpn.pid ]; then
+            sudo kill $(cat /tmp/vpn.pid) || true
+            echo "VPN 해제 완료"
+          fi
+
+      - name: 완료 알림 이메일
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import smtplib, os
+          from email.mime.text import MIMEText
+
+          status = os.environ.get('STATUS', 'unknown')
+          emoji = '✅' if status == 'success' else '❌'
+          msg = MIMEText(f'{emoji} Redash 동기화 {status}\n\n자동 실행 완료되었습니다.', 'plain', 'utf-8')
+          msg['Subject'] = f'[Redash Sync] 동기화 {emoji}'
+          msg['From'] = os.environ['GMAIL_USER']
+          msg['To'] = os.environ['WORK_EMAIL']
+
+          with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+              smtp.login(os.environ['GMAIL_USER'], os.environ['GMAIL_APP_PASSWORD'])
+              smtp.send_message(msg)
+          EOF
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          WORK_EMAIL: ${{ secrets.WORK_EMAIL }}
+          STATUS: ${{ job.status }}
