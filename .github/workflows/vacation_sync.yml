@@ -104,8 +104,8 @@ jobs:
               for num in data[0].split():
                   _, msg_data = mail.fetch(num, '(RFC822)')
                   msg = email.message_from_bytes(msg_data[0][1])
-                  sender = msg.get('From', '')
-                  if 'myrealtrip.com' not in sender:
+                  subject = msg.get('Subject', '')
+                  if 'Re:' not in subject and 'RE:' not in subject:
                       continue
                   body = ''
                   if msg.is_multipart():
