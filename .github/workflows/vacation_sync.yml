@@ -89,6 +89,17 @@ jobs:
         run: |
           python3 - <<'EOF'
           import imaplib, email, time, os, re
+          from email.header import decode_header as dh
+
+          def decode_subject(raw):
+              parts = dh(raw or '')
+              result = ''
+              for part, enc in parts:
+                  if isinstance(part, bytes):
+                      result += part.decode(enc or 'utf-8', errors='ignore')
+                  else:
+                      result += part
+              return result
 
           gmail_user = os.environ['GMAIL_USER']
           gmail_pass = os.environ['GMAIL_APP_PASSWORD']
@@ -104,7 +115,8 @@ jobs:
               for num in data[0].split():
                   _, msg_data = mail.fetch(num, '(RFC822)')
                   msg = email.message_from_bytes(msg_data[0][1])
-                  subject = msg.get('Subject', '')
+                  subject = decode_subject(msg.get('Subject', ''))
+                  print(f'  제목 확인: {subject}')
                   if 'Re:' not in subject and 'RE:' not in subject:
                       continue
                   body = ''
