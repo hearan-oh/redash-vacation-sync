@@ -57,7 +57,34 @@ jobs:
           echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
           echo '${{ secrets.GOOGLE_TOKEN }}' > token.json
 
+      - name: Redash 직접 접근 테스트 (VPN 없이)
+        id: redash_test
+        run: |
+          python3 - <<'EOF'
+          import requests, os
+
+          url = 'https://redash.myrealtrip.com/api/queries/21679?api_key=UIygrE9LGBrx5dqHAZmNrO0yKOltYxrPdEynnzfK'
+          try:
+              res = requests.get(url, timeout=10)
+              print(f'응답 코드: {res.status_code}')
+              if res.status_code == 200:
+                  print('✅ VPN 없이 Redash 접근 가능! VPN 단계 스킵합니다.')
+                  need_vpn = 'false'
+              else:
+                  print(f'❌ VPN 필요 (상태코드: {res.status_code})')
+                  need_vpn = 'true'
+          except Exception as e:
+              print(f'❌ VPN 필요 (연결 실패: {e})')
+              need_vpn = 'true'
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'need_vpn={need_vpn}\n')
+          EOF
+
+      # ── VPN 필요할 때만 실행 ─────────────────────────
+
       - name: OTP 요청 이메일 발송
+        if: steps.redash_test.outputs.need_vpn == 'true'
         run: |
           python3 - <<'EOF'
           import smtplib, os
@@ -72,7 +99,7 @@ jobs:
           )
           msg['Subject'] = '[Redash Sync] VPN OTP를 입력해주세요'
           msg['From'] = os.environ['GMAIL_USER']
-          msg['To'] = os.environ['GMAIL_USER']  # 테스트: Gmail로 발송
+          msg['To'] = os.environ['GMAIL_USER']
 
           with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
               smtp.login(os.environ['GMAIL_USER'], os.environ['GMAIL_APP_PASSWORD'])
@@ -82,9 +109,9 @@ jobs:
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          WORK_EMAIL: ${{ secrets.WORK_EMAIL }}
 
       - name: OTP 답장 대기 (최대 5분)
+        if: steps.redash_test.outputs.need_vpn == 'true'
         id: get_otp
         run: |
           python3 - <<'EOF'
@@ -153,6 +180,7 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
 
       - name: VPN 연결
+        if: steps.redash_test.outputs.need_vpn == 'true'
         run: |
           printf '%s\n%s\n' '${{ secrets.VPN_PASSWORD }}' '${{ steps.get_otp.outputs.otp }}' | \
             sudo openconnect --protocol=pulse mrt-vpn.myrealtrip.com \
@@ -164,11 +192,13 @@ jobs:
           sleep 5
           echo "VPN 연결 완료"
 
+      # ── 항상 실행 ────────────────────────────────────
+
       - name: sync.py 실행
         run: python3 -u sync.py
 
       - name: VPN 해제
-        if: always()
+        if: always() && steps.redash_test.outputs.need_vpn == 'true'
         run: |
           if [ -f /tmp/vpn.pid ]; then
             sudo kill $(cat /tmp/vpn.pid) || true
