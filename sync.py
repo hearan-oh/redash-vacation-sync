@@ -34,21 +34,35 @@ def get_bq_creds():
     return creds
 
 def bq_query(creds, sql):
-    """BigQuery 동기식 쿼리 실행"""
+    """BigQuery 동기식 쿼리 실행 (페이지네이션 포함)"""
+    import time
     headers = {'Authorization': f'Bearer {creds.token}', 'Content-Type': 'application/json'}
-    url = f'https://bigquery.googleapis.com/bigquery/v2/projects/{BQ_PROJECT}/queries'
+    post_url = f'https://bigquery.googleapis.com/bigquery/v2/projects/{BQ_PROJECT}/queries'
     body = {'query': sql, 'useLegacySql': False, 'timeoutMs': 60000, 'maxResults': 10000}
-    res = requests.post(url, headers=headers, json=body)
+    res = requests.post(post_url, headers=headers, json=body)
     data = res.json()
     if 'error' in data:
         raise Exception(f'BQ 오류: {data["error"]}')
+
+    job_id = data.get('jobReference', {}).get('jobId', '')
+    get_url = f'https://bigquery.googleapis.com/bigquery/v2/projects/{BQ_PROJECT}/queries/{job_id}'
+
+    # 쿼리 완료 대기 (jobComplete=False인 경우)
+    while not data.get('jobComplete', True):
+        time.sleep(3)
+        data = requests.get(get_url, headers=headers, params={'maxResults': 10000}).json()
+        if 'error' in data:
+            raise Exception(f'BQ 오류: {data["error"]}')
+
     schema = [f['name'] for f in data['schema']['fields']]
     rows = data.get('rows', [])
-    # 페이지네이션 처리
+
+    # 페이지네이션
     while data.get('pageToken'):
-        page_url = f'{url}?pageToken={data["pageToken"]}'
-        data = requests.get(page_url, headers=headers).json()
+        data = requests.get(get_url, headers=headers,
+                            params={'pageToken': data['pageToken'], 'maxResults': 10000}).json()
         rows += data.get('rows', [])
+
     return [{col: (v['v'] if v['v'] is not None else None)
              for col, v in zip(schema, row['f'])} for row in rows]
 
