@@ -50,7 +50,15 @@ jobs:
       - name: 패키지 설치
         run: |
           pip install -r requirements.txt
-          sudo apt-get install -y openconnect
+          # openconnect 최신 소스 빌드 (Ivanti Connect Secure 호환)
+          sudo apt-get install -y build-essential libgnutls28-dev libxml2-dev \
+            pkg-config autoconf automake libtool vpnc-scripts
+          git clone --depth=1 https://gitlab.com/openconnect/openconnect.git /tmp/openconnect
+          cd /tmp/openconnect && autoreconf -fvi
+          ./configure --without-gssapi --disable-manpages 2>&1 | tail -5
+          make -j$(nproc) 2>&1 | tail -5
+          sudo make install && sudo ldconfig
+          openconnect --version
 
       - name: 인증 파일 복원
         run: |
