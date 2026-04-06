@@ -1,38 +1,163 @@
-import requests
 import gspread
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+import requests
 import os
+import json
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from datetime import datetime, timedelta
 
 # ── 설정 ──────────────────────────────────────────
-REDASH_BASE = 'https://redash.myrealtrip.com'
-API_KEY     = 'UIygrE9LGBrx5dqHAZmNrO0yKOltYxrPdEynnzfK'
-SHEET_ID         = '1GeQctImT_N_C_BZ1cOOcy0T5Dg3zEIgf_p5i8B1WqqU'  # 내부용
-SHEET_ID_AGENCY  = '18lc2b5XH1qCxSyzE_KkaFUPyjwYooLyOlDsfq0nEzs4'  # 대행사용
-SCOPES      = ['https://www.googleapis.com/auth/spreadsheets',
-               'https://www.googleapis.com/auth/drive']
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-CREDS_FILE  = os.path.join(BASE_DIR, 'credentials.json')
-TOKEN_FILE  = os.path.join(BASE_DIR, 'token.json')
+SHEET_ID        = '1GeQctImT_N_C_BZ1cOOcy0T5Dg3zEIgf_p5i8B1WqqU'   # 내부용
+SHEET_ID_AGENCY = '18lc2b5XH1qCxSyzE_KkaFUPyjwYooLyOlDsfq0nEzs4'   # 대행사용
+SCOPES_SHEETS   = ['https://www.googleapis.com/auth/spreadsheets',
+                   'https://www.googleapis.com/auth/drive']
+BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
+CREDS_FILE      = os.path.join(BASE_DIR, 'credentials.json')
+TOKEN_FILE      = os.path.join(BASE_DIR, 'token.json')
+BQ_TOKEN_FILE   = os.path.join(BASE_DIR, 'bq_token.json')
+BQ_PROJECT      = 'mrtdata'
 
-# ── Google 인증 ────────────────────────────────────
+# ── BigQuery 인증 ──────────────────────────────────
+def get_bq_creds():
+    with open(BQ_TOKEN_FILE) as f:
+        t = json.load(f)
+    creds = Credentials(
+        token=t['token'], refresh_token=t['refresh_token'],
+        token_uri=t['token_uri'], client_id=t['client_id'],
+        client_secret=t['client_secret'], scopes=t['scopes']
+    )
+    creds.refresh(Request())
+    # 갱신된 토큰 저장
+    t['token'] = creds.token
+    with open(BQ_TOKEN_FILE, 'w') as f:
+        json.dump(t, f)
+    return creds
+
+def bq_query(creds, sql):
+    """BigQuery 동기식 쿼리 실행"""
+    headers = {'Authorization': f'Bearer {creds.token}', 'Content-Type': 'application/json'}
+    url = f'https://bigquery.googleapis.com/bigquery/v2/projects/{BQ_PROJECT}/queries'
+    body = {'query': sql, 'useLegacySql': False, 'timeoutMs': 60000, 'maxResults': 10000}
+    res = requests.post(url, headers=headers, json=body)
+    data = res.json()
+    if 'error' in data:
+        raise Exception(f'BQ 오류: {data["error"]}')
+    schema = [f['name'] for f in data['schema']['fields']]
+    rows = data.get('rows', [])
+    # 페이지네이션 처리
+    while data.get('pageToken'):
+        page_url = f'{url}?pageToken={data["pageToken"]}'
+        data = requests.get(page_url, headers=headers).json()
+        rows += data.get('rows', [])
+    return [{col: (v['v'] if v['v'] is not None else None)
+             for col, v in zip(schema, row['f'])} for row in rows]
+
+# ── BQ 쿼리: 파워링크 ──────────────────────────────
+SQL_POWERLINK = """
+WITH naver AS (
+    SELECT
+        basis_dt, campaign_name, adgroup_name, nccKeywordId, keyword, nccAdgroupId, device,
+        SUM(salesAmt) AS cost
+    FROM `mrtdata.edw.ST_ADS_STAT_NAVER_KEYWORD`
+    WHERE basis_dt >= '{start_date}' AND basis_dt <= '{end_date}'
+      AND basis_dt != CURRENT_DATE()
+      AND keyword IS NOT NULL
+      AND campaign_name != '브랜드검색'
+    GROUP BY 1,2,3,4,5,6,7
+),
+cm AS (
+    SELECT resve_id, SUM(CON_MARGIN) AS CON_MARGIN
+    FROM `mrtdata.edw_fpna.MART_FPNA_NONAIR_PROFIT_D`
+    GROUP BY 1
+),
+purchase AS (
+    SELECT ms.BASIS_DATE, RESVE_N_KEYWORD_ID AS n_keyword_id,
+        SUM(ms.SALES_KRW_PRICE) AS gmv,
+        SUM(c.CON_MARGIN) AS con_margin
+    FROM `mrtdata.edw_mart.MART_SALE_D` AS ms
+    LEFT JOIN cm AS c ON ms.RESVE_ID = c.resve_id
+    WHERE ms.BASIS_DATE BETWEEN '{start_date}' AND '{end_date}'
+      AND ms.kind = 1 AND RESVE_UTM_SOURCE IN ('NAD')
+    GROUP BY 1,2
+)
+SELECT
+    DATE_TRUNC(n.basis_dt, DAY) AS basis_dt,
+    campaign_name,
+    adgroup_name AS adset_name,
+    keyword AS ad_name,
+    SUM(n.cost) AS cost,
+    SUM(IFNULL(p.gmv, 0)) AS gmv,
+    SUM(IFNULL(p.con_margin, 0)) AS con_margin
+FROM naver n
+LEFT JOIN purchase p ON n.nccKeywordId = p.n_keyword_id AND n.basis_dt = p.BASIS_DATE
+WHERE n.cost > 0
+GROUP BY 1,2,3,4
+ORDER BY 1 DESC
+"""
+
+# ── BQ 쿼리: 쇼검광 ────────────────────────────────
+SQL_SHOPPING = """
+WITH pf AS (
+    SELECT
+        basis_dt, campaign_name, adgroup_name, device, nccAdId,
+        SUM(salesAmt) AS cost
+    FROM `mrtdata.edw.ST_ADS_STAT_NAVER_AD`
+    WHERE basis_dt >= '{start_date}' AND basis_dt <= '{end_date}'
+      AND basis_dt != CURRENT_DATE()
+    GROUP BY 1,2,3,4,5
+),
+str AS (
+    SELECT ad_id, product_id_of_mall, product_name
+    FROM `mrtdata.edw.DW_ADS_STAT_NAVER_MASTER_REPORT_SHOPPING_PRODUCT_AD`
+),
+cm AS (
+    SELECT resve_id, SUM(CON_MARGIN) AS CON_MARGIN
+    FROM `mrtdata.edw_fpna.MART_FPNA_NONAIR_PROFIT_D`
+    GROUP BY 1
+),
+purchase AS (
+    SELECT ms.BASIS_DATE, RESVE_N_AD AS n_ad,
+        SUM(ms.SALES_KRW_PRICE) AS gmv,
+        SUM(c.CON_MARGIN) AS con_margin
+    FROM `mrtdata.edw_mart.MART_SALE_D` AS ms
+    LEFT JOIN cm AS c ON ms.RESVE_ID = c.resve_id
+    WHERE ms.BASIS_DATE BETWEEN '{start_date}' AND '{end_date}'
+      AND ms.kind = 1 AND RESVE_UTM_SOURCE IN ('NaverShopping')
+      AND RESVE_N_CAMPAIGN_TYPE = '2'
+    GROUP BY 1,2
+)
+SELECT
+    DATE_TRUNC(pf.basis_dt, DAY) AS basis_dt,
+    pf.campaign_name,
+    pf.adgroup_name,
+    str.product_id_of_mall,
+    str.product_name,
+    SUM(pf.cost) AS cost,
+    SUM(IFNULL(p.gmv, 0)) AS gmv,
+    SUM(IFNULL(p.con_margin, 0)) AS con_margin
+FROM pf
+LEFT JOIN str ON str.ad_id = pf.nccAdId
+LEFT JOIN purchase p ON p.n_ad = pf.nccAdId AND p.BASIS_DATE = pf.basis_dt
+WHERE pf.cost > 0
+GROUP BY 1,2,3,4,5
+ORDER BY 1 DESC
+"""
+
+# ── Google Sheets 인증 ─────────────────────────────
 def get_gspread_client():
     creds = None
     if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES_SHEETS)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
+            with open(TOKEN_FILE, 'w') as f:
+                f.write(creds.to_json())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(TOKEN_FILE, 'w') as f:
-            f.write(creds.to_json())
+            raise Exception('Google Sheets 토큰 만료 - token.json 갱신 필요')
     return gspread.authorize(creds)
 
-# ── CM 결과 판정 ────────────────────────────────────
+# ── CM 판정 ────────────────────────────────────────
 def get_cm_result(cm_roas):
     if cm_roas >= 200: return 'CM ROAS 200% 이상'
     if cm_roas >= 100: return 'CM ROAS 100% 이상'
@@ -45,7 +170,7 @@ def get_signal(cm_roas):
     if cm_roas >= 50:  return '🟡'
     return '🔴'
 
-# ── adset_name 파싱 ─────────────────────────────────
+# ── adset_name 파싱 ────────────────────────────────
 def parse_adset(adset_name, campaign_name):
     parts   = (adset_name or '').split('_')
     country = parts[1] if len(parts) > 1 else ''
@@ -61,65 +186,120 @@ def parse_adset(adset_name, campaign_name):
     else:                         vertical = ''
     return country, city, vertical
 
-# ── Redash API 호출 ────────────────────────────────
-def fetch_redash(query_id, start_date, end_date):
-    import time
-    url  = f'{REDASH_BASE}/api/queries/{query_id}/results?api_key={API_KEY}'
-    body = {'parameters': {'start_date': start_date, 'end_date': end_date, 'group_by': 'DAY'}}
-    res  = requests.post(url, json=body, timeout=120)
-    data = res.json()
-
-    if 'query_result' in data:
-        return data['query_result']['data']['rows']
-
-    if 'job' in data:
-        job_id = data['job']['id']
-        for _ in range(60):
-            time.sleep(3)
-            job_res = requests.get(f'{REDASH_BASE}/api/jobs/{job_id}?api_key={API_KEY}').json()
-            if job_res['job']['status'] == 3:
-                result_id = job_res['job']['query_result_id']
-                r = requests.get(f'{REDASH_BASE}/api/query_results/{result_id}?api_key={API_KEY}').json()
-                return r['query_result']['data']['rows']
-            if job_res['job']['status'] == 4:
-                raise Exception('쿼리 실패: ' + str(job_res['job'].get('error')))
-        raise Exception('쿼리 타임아웃')
-
-    raise Exception('Redash 응답 오류')
-
-# ── 주차 레이블 변환 ────────────────────────────────
+# ── 주차 레이블 ────────────────────────────────────
 def get_week_label(date_str):
-    """날짜 → 해당 주 월~일 범위 레이블 (예: 03/18~03/24)"""
     try:
-        d = datetime.strptime(date_str, '%Y-%m-%d')
+        d = datetime.strptime(str(date_str)[:10], '%Y-%m-%d')
         monday = d - timedelta(days=d.weekday())
         sunday = monday + timedelta(days=6)
         return f"{monday.strftime('%Y-%m/%d')}~{sunday.strftime('%m/%d')}"
     except:
         return ''
 
-# ── 주차별 시트 업데이트 (대행사용) ──────────────────
+# ── 시트 쓰기 (청크) ───────────────────────────────
+def write_chunks(ws, data, chunk=2000):
+    import time
+    def safe(v):
+        if v is None: return ''
+        if isinstance(v, float) and v != v: return ''
+        return v
+    safe_data = [[safe(c) for c in row] for row in data]
+    ws.clear()
+    for i in range(0, len(safe_data), chunk):
+        for attempt in range(5):
+            try:
+                ws.update(safe_data[i:i+chunk], f'A{i+1}')
+                time.sleep(1.5)
+                break
+            except Exception as e:
+                if attempt == 4: raise
+                print(f'    재시도 {attempt+1}/5: {e}')
+                time.sleep(10 * (attempt + 1))
+
+LEGEND = [['신호', '의미'],
+          ['🟢', '성과 매우 우수 + 상향 조정 등 적극 액션 필요'],
+          ['🔵', '성과 준수 + 상향 조정'],
+          ['🟡', '성과 미달'],
+          ['🔴', '성과 매우 저조 + 즉각 하향 조정 필요']]
+
+# ── 시트 업데이트 ──────────────────────────────────
+def update_sheet(gc, sheet_base, rows, ad_name_field, include_product=False):
+    wb        = gc.open_by_key(SHEET_ID)
+    wb_agency = gc.open_by_key(SHEET_ID_AGENCY)
+
+    cols_in = 11 if include_product else 10
+    cols_ag = 8  if include_product else 7
+
+    try:    ws_in = wb.worksheet(sheet_base + '_내부')
+    except: ws_in = wb.add_worksheet(sheet_base + '_내부', rows=5000, cols=cols_in)
+    try:    ws_ag = wb.worksheet(sheet_base)
+    except: ws_ag = wb.add_worksheet(sheet_base, rows=5000, cols=cols_ag)
+    try:    ws_ag2 = wb_agency.worksheet(sheet_base)
+    except: ws_ag2 = wb_agency.add_worksheet(sheet_base, rows=5000, cols=cols_ag)
+
+    if include_product:
+        in_headers = ['날짜', '캠페인명', '그룹명', '상품ID', '상품명', '광고비', 'GMV', '공헌이익', 'CM ROAS(%)', '신호', 'CM 결과']
+        ag_headers = ['날짜', '캠페인명', '그룹명', '상품ID', '상품명', '광고비', 'GMV', '신호']
+    else:
+        in_headers = ['날짜', '캠페인명', '그룹명', '키워드', '광고비', 'GMV', '공헌이익', 'CM ROAS(%)', '신호', 'CM 결과']
+        ag_headers = ['날짜', '캠페인명', '그룹명', '키워드', '광고비', 'GMV', '신호']
+
+    in_data, ag_data = [in_headers], [ag_headers]
+
+    for row in rows:
+        adset      = row.get(ad_name_field, '') or ''
+        campaign   = row.get('campaign_name', '') or ''
+        cost       = float(row.get('cost', 0) or 0)
+        gmv        = float(row.get('gmv',  0) or 0)
+        con_margin = float(row.get('con_margin', 0) or 0)
+        cm_roas    = round(con_margin / cost * 100, 1) if cost > 0 else 0
+        signal     = get_signal(cm_roas)
+        cm_result  = get_cm_result(cm_roas)
+        basis_dt   = str(row.get('basis_dt', ''))[:10]
+
+        if include_product:
+            product_id   = row.get('product_id_of_mall', '') or ''
+            product_name = row.get('product_name', '') or ''
+            in_data.append([basis_dt, campaign, adset, product_id, product_name,
+                            round(cost), round(gmv), round(con_margin), cm_roas, signal, cm_result])
+            ag_data.append([basis_dt, campaign, adset, product_id, product_name,
+                            round(cost), round(gmv), signal])
+        else:
+            keyword = row.get('ad_name', '') or ''
+            in_data.append([basis_dt, campaign, adset, keyword,
+                            round(cost), round(gmv), round(con_margin), cm_roas, signal, cm_result])
+            ag_data.append([basis_dt, campaign, adset, keyword,
+                            round(cost), round(gmv), signal])
+
+    write_chunks(ws_in, in_data)
+    write_chunks(ws_ag, ag_data)
+    write_chunks(ws_ag2, ag_data)
+
+    legend_col  = 'J1' if include_product else 'I1'
+    resize_cols = 11  if include_product else 10
+    ws_ag2.resize(cols=resize_cols)
+    ws_ag2.update(LEGEND, legend_col)
+    print(f'  {sheet_base} 완료 - {len(rows)}행')
+
+# ── 주차별 시트 업데이트 (대행사용) ───────────────────
 def update_weekly_sheet(gc, sheet_base, rows, ad_name_field, include_product=False):
     wb_agency = gc.open_by_key(SHEET_ID_AGENCY)
 
-    # 주차별 집계
     weekly = {}
     for row in rows:
-        adset    = row.get(ad_name_field, '')
-        campaign = row.get('campaign_name', '')
-        country, city, vertical = parse_adset(adset, campaign)
-        cost       = row.get('cost', 0) or 0
-        gmv        = row.get('gmv',  0) or 0
-        con_margin = row.get('con_margin', 0) or 0
+        adset      = row.get(ad_name_field, '') or ''
+        campaign   = row.get('campaign_name', '') or ''
+        cost       = float(row.get('cost', 0) or 0)
+        gmv        = float(row.get('gmv',  0) or 0)
+        con_margin = float(row.get('con_margin', 0) or 0)
         week_label = get_week_label(row.get('basis_dt', ''))
 
         if include_product:
-            product_id   = str(row.get('product_id_of_mall', ''))
-            product_name = row.get('product_name', '')
-            key = (week_label, campaign, adset, product_id, product_name)
+            key = (week_label, campaign, adset,
+                   str(row.get('product_id_of_mall', '') or ''),
+                   row.get('product_name', '') or '')
         else:
-            keyword = row.get('ad_name', '')
-            key = (week_label, campaign, adset, keyword)
+            key = (week_label, campaign, adset, row.get('ad_name', '') or '')
 
         if key not in weekly:
             weekly[key] = {'cost': 0, 'gmv': 0, 'con_margin': 0}
@@ -127,7 +307,6 @@ def update_weekly_sheet(gc, sheet_base, rows, ad_name_field, include_product=Fal
         weekly[key]['gmv']        += gmv
         weekly[key]['con_margin'] += con_margin
 
-    # 헤더
     if include_product:
         ag_headers = ['주차', '캠페인명', '그룹명', '상품ID', '상품명', '광고비', 'GMV', '신호']
     else:
@@ -144,13 +323,12 @@ def update_weekly_sheet(gc, sheet_base, rows, ad_name_field, include_product=Fal
         if include_product:
             week_label, campaign, adset, product_id, product_name = key
             ag_data.append([week_label, campaign, adset, product_id, product_name,
-                            round(cost, 0), round(v['gmv'], 0), signal])
+                            round(cost), round(v['gmv']), signal])
         else:
             week_label, campaign, adset, keyword = key
             ag_data.append([week_label, campaign, adset, keyword,
-                            round(cost, 0), round(v['gmv'], 0), signal])
+                            round(cost), round(v['gmv']), signal])
 
-    # 시트 탭 생성/업데이트
     tab_name    = sheet_base + '_주차별 CM 성과'
     legend_col  = 'J1' if include_product else 'I1'
     resize_cols = 11  if include_product else 10
@@ -160,97 +338,9 @@ def update_weekly_sheet(gc, sheet_base, rows, ad_name_field, include_product=Fal
 
     ws.clear()
     ws.update(ag_data, 'A1')
-
-    legend = [['신호', '의미'], ['🟢', '성과 매우 우수 + 상향 조정 등 적극 액션 필요'],
-              ['🔵', '성과 준수 + 상향 조정'], ['🟡', '성과 미달'],
-              ['🔴', '성과 매우 저조 + 즉각 하향 조정 필요']]
     ws.resize(cols=resize_cols)
-    ws.update(legend, legend_col)
+    ws.update(LEGEND, legend_col)
     print(f'  {tab_name} 완료 - {len(ag_data)-1}행')
-
-# ── 시트 업데이트 ──────────────────────────────────
-def update_sheet(gc, sheet_base, rows, ad_name_field, include_product=False):
-    wb        = gc.open_by_key(SHEET_ID)
-    wb_agency = gc.open_by_key(SHEET_ID_AGENCY)
-
-    cols_in = 11 if include_product else 10
-    cols_ag = 8 if include_product else 7
-
-    try:    ws_in = wb.worksheet(sheet_base + '_내부')
-    except: ws_in = wb.add_worksheet(sheet_base + '_내부', rows=5000, cols=cols_in)
-
-    try:    ws_ag = wb.worksheet(sheet_base)
-    except: ws_ag = wb.add_worksheet(sheet_base, rows=5000, cols=cols_ag)
-
-    try:    ws_ag2 = wb_agency.worksheet(sheet_base)
-    except: ws_ag2 = wb_agency.add_worksheet(sheet_base, rows=5000, cols=cols_ag)
-
-    if include_product:
-        in_headers = ['날짜', '캠페인명', '그룹명', '상품ID', '상품명', '광고비', 'GMV', '공헌이익', 'CM ROAS(%)', '신호', 'CM 결과']
-        ag_headers = ['날짜', '캠페인명', '그룹명', '상품ID', '상품명', '광고비', 'GMV', '신호']
-    else:
-        in_headers = ['날짜', '캠페인명', '그룹명', '키워드', '광고비', 'GMV', '공헌이익', 'CM ROAS(%)', '신호', 'CM 결과']
-        ag_headers = ['날짜', '캠페인명', '그룹명', '키워드', '광고비', 'GMV', '신호']
-
-    in_data, ag_data = [in_headers], [ag_headers]
-
-    for row in rows:
-        adset      = row.get(ad_name_field, '')
-        campaign   = row.get('campaign_name', '')
-        country, city, vertical = parse_adset(adset, campaign)
-        cost       = row.get('cost', 0) or 0
-        gmv        = row.get('gmv',  0) or 0
-        con_margin = row.get('con_margin', 0) or 0
-        cm_roas    = round(con_margin / cost * 100, 1) if cost > 0 else 0
-        cm_result  = get_cm_result(cm_roas)
-        signal     = get_signal(cm_roas)
-
-        campaign = row.get('campaign_name', '')
-        if include_product:
-            product_id   = row.get('product_id_of_mall', '')
-            product_name = row.get('product_name', '')
-            in_data.append([row.get('basis_dt', ''), campaign, adset,
-                            product_id, product_name, cost, gmv, con_margin, cm_roas, signal, cm_result])
-            ag_data.append([row.get('basis_dt', ''), campaign, adset, product_id, product_name,
-                            cost, gmv, signal])
-        else:
-            keyword = row.get('ad_name', '')
-            in_data.append([row.get('basis_dt', ''), campaign, adset,
-                            keyword, cost, gmv, con_margin, cm_roas, signal, cm_result])
-            ag_data.append([row.get('basis_dt', ''), campaign, adset, keyword,
-                            cost, gmv, signal])
-
-    def safe(v):
-        if v is None: return ''
-        if isinstance(v, float) and (v != v): return ''  # NaN
-        return v
-
-    def write_chunks(ws, data, chunk=2000):
-        import time
-        safe_data = [[safe(c) for c in row] for row in data]
-        ws.clear()
-        for i in range(0, len(safe_data), chunk):
-            for attempt in range(5):
-                try:
-                    ws.update(safe_data[i:i+chunk], f'A{i+1}')
-                    time.sleep(1.5)
-                    break
-                except Exception as e:
-                    if attempt == 4:
-                        raise
-                    print(f'    재시도 {attempt+1}/5: {e}')
-                    time.sleep(10 * (attempt + 1))
-
-    write_chunks(ws_in, in_data)
-    write_chunks(ws_ag, ag_data)
-    write_chunks(ws_ag2, ag_data)
-
-    legend = [['신호', '의미'], ['🟢', '성과 매우 우수 + 상향 조정 등 적극 액션 필요'], ['🔵', '성과 준수 + 상향 조정'], ['🟡', '성과 미달'], ['🔴', '성과 매우 저조 + 즉각 하향 조정 필요']]
-    legend_col  = 'J1' if include_product else 'I1'
-    resize_cols = 11  if include_product else 10
-    ws_ag2.resize(cols=resize_cols)
-    ws_ag2.update(legend, legend_col)
-    print(f'  {sheet_base} 완료 - {len(rows)}행')
 
 # ── 메인 ───────────────────────────────────────────
 def main():
@@ -258,16 +348,24 @@ def main():
     start_date = (today - timedelta(days=90)).strftime('%Y-%m-%d')
     end_date   = (today - timedelta(days=1)).strftime('%Y-%m-%d')
 
-    print('Google 인증 중...')
+    print('BigQuery 인증 중...')
+    bq_creds = get_bq_creds()
+
+    print(f'파워링크 BQ 쿼리 실행 중... ({start_date} ~ {end_date})')
+    rows_pl = bq_query(bq_creds, SQL_POWERLINK.format(start_date=start_date, end_date=end_date))
+    print(f'  파워링크 {len(rows_pl)}행 수신')
+
+    print('쇼검광 BQ 쿼리 실행 중...')
+    rows_sh = bq_query(bq_creds, SQL_SHOPPING.format(start_date=start_date, end_date=end_date))
+    print(f'  쇼검광 {len(rows_sh)}행 수신')
+
+    print('Google Sheets 인증 중...')
     gc = get_gspread_client()
 
-    print('파워링크 데이터 가져오는 중...')
-    rows_pl = fetch_redash(21679, start_date, end_date)
+    print('Google Sheets 업데이트 중...')
     update_sheet(gc, '파워링크', rows_pl, 'adset_name')
     update_weekly_sheet(gc, '파워링크', rows_pl, 'adset_name')
 
-    print('쇼검광 데이터 가져오는 중...')
-    rows_sh = fetch_redash(21686, start_date, end_date)
     update_sheet(gc, '쇼검광', rows_sh, 'adgroup_name', include_product=True)
     update_weekly_sheet(gc, '쇼검광', rows_sh, 'adgroup_name', include_product=True)
 
