@@ -1,4 +1,4 @@
-name: Vacation Redash Sync
+name: Daily Redash Sync
 
 on:
   schedule:
@@ -6,35 +6,7 @@ on:
   workflow_dispatch:         # 수동 테스트용
 
 jobs:
-  check-vacation:
-    runs-on: ubuntu-latest
-    outputs:
-      is_vacation: ${{ steps.check.outputs.is_vacation }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: 휴가 여부 확인
-        id: check
-        run: |
-          python3 - <<'EOF'
-          import json, os
-          from datetime import date
-
-          with open('vacation.json') as f:
-              periods = json.load(f)
-
-          today = date.today().isoformat()
-          is_vacation = any(p['start'] <= today <= p['end'] for p in periods)
-          print(f"오늘 날짜: {today}")
-          print(f"휴가 여부: {is_vacation}")
-
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-              out.write(f'is_vacation={str(is_vacation).lower()}\n')
-          EOF
-
   sync:
-    needs: check-vacation
-    if: needs.check-vacation.outputs.is_vacation == 'true'
     runs-on: ubuntu-latest
 
     steps:
