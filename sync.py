@@ -6,16 +6,18 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from datetime import datetime, timedelta
 
-# ── 설정 ──────────────────────────────────────────
-SHEET_ID        = '1GeQctImT_N_C_BZ1cOOcy0T5Dg3zEIgf_p5i8B1WqqU'   # 내부용
-SHEET_ID_AGENCY = '18lc2b5XH1qCxSyzE_KkaFUPyjwYooLyOlDsfq0nEzs4'   # 대행사용
+# ── ✏️ 여기만 수정하세요 ───────────────────────────
+SHEET_ID        = '1GeQctImT_N_C_BZ1cOOcy0T5Dg3zEIgf_p5i8B1WqqU'   # 내부용 구글 시트 ID
+SHEET_ID_AGENCY = '18lc2b5XH1qCxSyzE_KkaFUPyjwYooLyOlDsfq0nEzs4'   # 대행사용 구글 시트 ID
+BQ_PROJECT      = 'mrtdata'                                           # BigQuery 프로젝트 ID
+# ─────────────────────────────────────────────────
+
 SCOPES_SHEETS   = ['https://www.googleapis.com/auth/spreadsheets',
                    'https://www.googleapis.com/auth/drive']
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 CREDS_FILE      = os.path.join(BASE_DIR, 'credentials.json')
 TOKEN_FILE      = os.path.join(BASE_DIR, 'token.json')
 BQ_TOKEN_FILE   = os.path.join(BASE_DIR, 'bq_token.json')
-BQ_PROJECT      = 'mrtdata'
 
 # ── BigQuery 인증 ──────────────────────────────────
 def get_bq_creds():
