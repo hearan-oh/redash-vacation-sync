@@ -46,13 +46,16 @@ def bq_query(creds, sql):
     if 'error' in data:
         raise Exception(f'BQ 오류: {data["error"]}')
 
-    job_id = data.get('jobReference', {}).get('jobId', '')
+    job_ref = data.get('jobReference', {})
+    job_id = job_ref.get('jobId', '')
+    location = job_ref.get('location', '')
     get_url = f'https://bigquery.googleapis.com/bigquery/v2/projects/{BQ_PROJECT}/queries/{job_id}'
 
     # 쿼리 완료 대기 (jobComplete=False인 경우)
     while not data.get('jobComplete', True):
         time.sleep(3)
-        data = requests.get(get_url, headers=headers, params={'maxResults': 0}).json()
+        data = requests.get(get_url, headers=headers,
+                            params={'maxResults': 0, 'location': location}).json()
         if 'error' in data:
             raise Exception(f'BQ 오류: {data["error"]}')
 
@@ -62,7 +65,7 @@ def bq_query(creds, sql):
 
     # getQueryResults로 전체 결과 페이지네이션
     rows = []
-    params = {'maxResults': 50000}
+    params = {'maxResults': 50000, 'location': location}
     while True:
         resp = requests.get(get_url, headers=headers, params=params).json()
         if 'error' in resp:
@@ -71,7 +74,7 @@ def bq_query(creds, sql):
         page_token = resp.get('pageToken')
         if not page_token:
             break
-        params = {'pageToken': page_token, 'maxResults': 50000}
+        params = {'pageToken': page_token, 'maxResults': 50000, 'location': location}
 
     print(f'    실제 수신: {len(rows)}행')
     return [{col: (v['v'] if v['v'] is not None else None)
