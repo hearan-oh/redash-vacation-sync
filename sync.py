@@ -36,11 +36,11 @@ def get_bq_creds():
     return creds
 
 def bq_query(creds, sql):
-    """BigQuery 동기식 쿼리 실행 (페이지네이션 포함)"""
+    """BigQuery 쿼리 실행 (getQueryResults로 명시적 페이지네이션)"""
     import time
     headers = {'Authorization': f'Bearer {creds.token}', 'Content-Type': 'application/json'}
     post_url = f'https://bigquery.googleapis.com/bigquery/v2/projects/{BQ_PROJECT}/queries'
-    body = {'query': sql, 'useLegacySql': False, 'timeoutMs': 60000, 'maxResults': 10000}
+    body = {'query': sql, 'useLegacySql': False, 'timeoutMs': 60000, 'maxResults': 0}
     res = requests.post(post_url, headers=headers, json=body)
     data = res.json()
     if 'error' in data:
@@ -52,19 +52,28 @@ def bq_query(creds, sql):
     # 쿼리 완료 대기 (jobComplete=False인 경우)
     while not data.get('jobComplete', True):
         time.sleep(3)
-        data = requests.get(get_url, headers=headers, params={'maxResults': 10000}).json()
+        data = requests.get(get_url, headers=headers, params={'maxResults': 0}).json()
         if 'error' in data:
             raise Exception(f'BQ 오류: {data["error"]}')
 
     schema = [f['name'] for f in data['schema']['fields']]
-    rows = data.get('rows', [])
+    total_rows = int(data.get('totalRows', 0))
+    print(f'    BQ totalRows: {total_rows}')
 
-    # 페이지네이션
-    while data.get('pageToken'):
-        data = requests.get(get_url, headers=headers,
-                            params={'pageToken': data['pageToken'], 'maxResults': 10000}).json()
-        rows += data.get('rows', [])
+    # getQueryResults로 전체 결과 페이지네이션
+    rows = []
+    params = {'maxResults': 50000}
+    while True:
+        resp = requests.get(get_url, headers=headers, params=params).json()
+        if 'error' in resp:
+            raise Exception(f'BQ 페이지네이션 오류: {resp["error"]}')
+        rows += resp.get('rows', [])
+        page_token = resp.get('pageToken')
+        if not page_token:
+            break
+        params = {'pageToken': page_token, 'maxResults': 50000}
 
+    print(f'    실제 수신: {len(rows)}행')
     return [{col: (v['v'] if v['v'] is not None else None)
              for col, v in zip(schema, row['f'])} for row in rows]
 
