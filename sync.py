@@ -36,7 +36,7 @@ def get_bq_creds():
     return creds
 
 def bq_query(creds, sql):
-    """BigQuery 쿼리 실행 (getQueryResults로 명시적 페이지네이션)"""
+    """BigQuery 쿼리 실행 (startIndex 기반 페이지네이션)"""
     import time
     headers = {'Authorization': f'Bearer {creds.token}', 'Content-Type': 'application/json'}
     post_url = f'https://bigquery.googleapis.com/bigquery/v2/projects/{BQ_PROJECT}/queries'
@@ -63,20 +63,28 @@ def bq_query(creds, sql):
     total_rows = int(data.get('totalRows', 0))
     print(f'    BQ totalRows: {total_rows}')
 
-    # getQueryResults로 전체 결과 페이지네이션
+    # startIndex 기반 페이지네이션 (pageToken 미반환 이슈 방지)
     rows = []
-    params = {'maxResults': 50000, 'location': location}
-    while True:
+    start_index = 0
+    page_size = 10000
+    while start_index < total_rows:
+        params = {'maxResults': page_size, 'startIndex': start_index, 'location': location}
         resp = requests.get(get_url, headers=headers, params=params).json()
         if 'error' in resp:
             raise Exception(f'BQ 페이지네이션 오류: {resp["error"]}')
-        rows += resp.get('rows', [])
-        page_token = resp.get('pageToken')
-        if not page_token:
+        page_rows = resp.get('rows', [])
+        if not page_rows:
+            print(f'    ⚠️ 빈 페이지 수신 (startIndex={start_index})')
             break
-        params = {'pageToken': page_token, 'maxResults': 50000, 'location': location}
+        rows += page_rows
+        start_index += len(page_rows)
+        if start_index < total_rows:
+            print(f'    진행: {start_index}/{total_rows}행...')
 
     print(f'    실제 수신: {len(rows)}행')
+    if len(rows) != total_rows:
+        print(f'    ⚠️ 경고: totalRows({total_rows})와 실제 수신({len(rows)})이 다름')
+
     return [{col: (v['v'] if v['v'] is not None else None)
              for col, v in zip(schema, row['f'])} for row in rows]
 
