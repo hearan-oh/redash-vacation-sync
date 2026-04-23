@@ -2,7 +2,7 @@ name: Daily Redash Sync
 
 on:
   schedule:
-    - cron: '0 2 * * 1-5'  # 매일 평일 11:00 KST (= 02:00 UTC)
+    - cron: '30 23 * * 0-4'  # 매일 평일 08:30 KST (= 전날 23:30 UTC). GitHub Actions 지연 2h 버퍼 → 11시 데드라인 안정
   workflow_dispatch:         # 수동 테스트용
 
 jobs:
