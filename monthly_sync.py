@@ -23,7 +23,8 @@ from datetime import datetime, timedelta
 # ── ✏️ 여기만 수정하세요 ───────────────────────────
 SHEET_ID_AGENCY = '18lc2b5XH1qCxSyzE_KkaFUPyjwYooLyOlDsfq0nEzs4'
 BQ_PROJECT      = 'mrtdata'
-LOOKBACK_DAYS   = 90  # BQ 조회 윈도우
+LOOKBACK_DAYS   = 90        # BQ 조회 윈도우
+BACKFILL_FROM   = '2026-03' # 이 월 이전 데이터는 시트에 보이지 않게 (백필/보존 모두 제외)
 # ─────────────────────────────────────────────────
 
 SCOPES_SHEETS = ['https://www.googleapis.com/auth/spreadsheets',
@@ -250,6 +251,7 @@ def update_monthly_sheet(gc, sheet_base, rows, start_date, include_product=False
     backfill        = bq_months - existing_months
     if not window_start_full:
         backfill.discard(window_start_month)
+    backfill        = {m for m in backfill if m >= BACKFILL_FROM}  # BACKFILL_FROM 이전 월은 백필 X
     refresh_months |= backfill
 
     # 갱신 대상 월의 새 행 (BQ가 이미 월 단위로 집계됨 → row 1개 = 시트 1행)
@@ -277,11 +279,11 @@ def update_monthly_sheet(gc, sheet_base, rows, start_date, include_product=False
             new_rows.append([month_label, campaign, adset, keyword,
                              round(cost), round(gmv), signal])
 
-    # 보존 대상 행 (refresh 대상 월이 아닌 기존 시트 행)
+    # 보존 대상 행 (refresh 대상이 아니면서 BACKFILL_FROM 이상인 기존 행만)
     preserved = []
     if existing and len(existing) > 1:
         for r in existing[1:]:
-            if r and r[0] and r[0] not in refresh_months:
+            if r and r[0] and r[0] not in refresh_months and r[0] >= BACKFILL_FROM:
                 preserved.append(r)
 
     all_rows = preserved + new_rows
