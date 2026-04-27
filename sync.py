@@ -404,6 +404,7 @@ def main():
 
     update_sheet(gc, '쇼검광', rows_sh, 'adgroup_name', include_product=True)
     update_weekly_sheet(gc, '쇼검광', rows_sh, 'adgroup_name', include_product=True)
+    # 월별 CM 성과 탭은 monthly_sync.py가 별도로 담당
 
     print('전체 완료:', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 

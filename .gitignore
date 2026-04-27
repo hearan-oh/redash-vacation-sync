@@ -1,0 +1,9 @@
+# 인증 토큰 (GitHub Secrets로 관리)
+bq_token.json
+credentials.json
+token.json
+
+# 도구 캐시
+.omc/
+__pycache__/
+*.pyc

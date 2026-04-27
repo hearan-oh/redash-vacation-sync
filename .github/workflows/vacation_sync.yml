@@ -29,6 +29,9 @@ jobs:
       - name: sync.py 실행
         run: python3 -u sync.py
 
+      - name: monthly_sync.py 실행 (월별 CM 신호 탭)
+        run: python3 -u monthly_sync.py
+
       - name: 완료 알림 이메일
         if: always()
         run: |
