@@ -213,15 +213,26 @@ LEGEND = [['신호', '의미'],
           ['🟡', '성과 미달'],
           ['🔴', '성과 매우 저조 + 즉각 하향 조정 필요']]
 
-# ── 시트 업데이트 ──────────────────────────────────
+# ── 시트 업데이트 (월별 분리 탭, 멱등) ─────────────
 def update_monthly_sheet(gc, sheet_base, rows, start_date, include_product=False):
+    """
+    월별로 분리된 탭에 쓰기. 탭 이름 = {sheet_base}_월별 성과_{N}월 (예: 파워링크_월별 성과_3월).
+
+    - 멱등: BQ에 있는 모든 월(BACKFILL_FROM 이상)을 매번 다시 그림.
+    - 윈도우 시작 부분월(예: 1/27~1/31)은 부정확하므로 제외.
+    - BQ 윈도우 밖으로 나간 월은 BQ에 없어서 자동으로 안 그려짐 → 마지막 상태 보존됨.
+    - 레거시 통합 탭({sheet_base}_월별 CM 성과)은 자동 삭제.
+    """
     wb_agency = gc.open_by_key(SHEET_ID_AGENCY)
-    today          = datetime.today()
-    current_month  = today.strftime('%Y-%m')
-    prev_month     = (today.replace(day=1) - timedelta(days=1)).strftime('%Y-%m')
-    refresh_months = {current_month}
-    if today.day <= 5:
-        refresh_months.add(prev_month)
+
+    # 레거시 통합 탭 삭제 (최초 1회 효과)
+    legacy_tab = sheet_base + '_월별 CM 성과'
+    try:
+        ws_legacy = wb_agency.worksheet(legacy_tab)
+        wb_agency.del_worksheet(ws_legacy)
+        print(f'  레거시 탭 삭제: {legacy_tab}')
+    except Exception:
+        pass
 
     window_start_dt    = datetime.strptime(start_date, '%Y-%m-%d')
     window_start_month = window_start_dt.strftime('%Y-%m')
@@ -232,72 +243,60 @@ def update_monthly_sheet(gc, sheet_base, rows, start_date, include_product=False
     else:
         ag_headers = ['월', '캠페인명', '그룹명', '키워드', '광고비', 'GMV', '신호']
 
-    tab_name    = sheet_base + '_월별 CM 성과'
     cols        = 8 if include_product else 7
     legend_col  = 'J1' if include_product else 'I1'
     resize_cols = 11  if include_product else 10
 
-    try:
-        ws = wb_agency.worksheet(tab_name)
-        existing = ws.get_all_values()
-    except:
-        ws = wb_agency.add_worksheet(tab_name, rows=2000, cols=cols)
-        existing = []
-
-    # 백필 대상 결정
-    bq_months       = {str(r.get('month_label', '') or '') for r in rows}
-    bq_months.discard('')
-    existing_months = {r[0] for r in existing[1:] if r and r[0]} if existing and len(existing) > 1 else set()
-    backfill        = bq_months - existing_months
-    if not window_start_full:
-        backfill.discard(window_start_month)
-    backfill        = {m for m in backfill if m >= BACKFILL_FROM}  # BACKFILL_FROM 이전 월은 백필 X
-    refresh_months |= backfill
-
-    # 갱신 대상 월의 새 행 (BQ가 이미 월 단위로 집계됨 → row 1개 = 시트 1행)
-    new_rows = []
+    # 월별 그룹핑 (BACKFILL_FROM 이전, 윈도우 시작 부분월은 제외)
+    by_month = {}
     for row in rows:
-        month_label = str(row.get('month_label', '') or '')
-        if month_label not in refresh_months:
+        m = str(row.get('month_label', '') or '')
+        if not m or m < BACKFILL_FROM:
             continue
-        cost       = float(row.get('cost', 0) or 0)
-        gmv        = float(row.get('gmv',  0) or 0)
-        con_margin = float(row.get('con_margin', 0) or 0)
-        cm_roas    = round(con_margin / cost * 100, 1) if cost > 0 else 0
-        signal     = get_signal(cm_roas)
-        campaign   = row.get('campaign_name', '') or ''
+        if not window_start_full and m == window_start_month:
+            continue
+        by_month.setdefault(m, []).append(row)
 
-        if include_product:
-            adset        = row.get('adgroup_name', '') or ''
-            product_id   = str(row.get('product_id_of_mall', '') or '')
-            product_name = row.get('product_name', '') or ''
-            new_rows.append([month_label, campaign, adset, product_id, product_name,
+    for month_label in sorted(by_month.keys()):
+        m_num    = int(month_label.split('-')[1])
+        tab_name = f'{sheet_base}_월별 성과_{m_num}월'
+
+        body = []
+        for row in by_month[month_label]:
+            cost       = float(row.get('cost', 0) or 0)
+            gmv        = float(row.get('gmv',  0) or 0)
+            con_margin = float(row.get('con_margin', 0) or 0)
+            cm_roas    = round(con_margin / cost * 100, 1) if cost > 0 else 0
+            signal     = get_signal(cm_roas)
+            campaign   = row.get('campaign_name', '') or ''
+
+            if include_product:
+                adset        = row.get('adgroup_name', '') or ''
+                product_id   = str(row.get('product_id_of_mall', '') or '')
+                product_name = row.get('product_name', '') or ''
+                body.append([month_label, campaign, adset, product_id, product_name,
                              round(cost), round(gmv), signal])
-        else:
-            adset   = row.get('adset_name', '') or ''
-            keyword = row.get('ad_name', '') or ''
-            new_rows.append([month_label, campaign, adset, keyword,
+            else:
+                adset   = row.get('adset_name', '') or ''
+                keyword = row.get('ad_name', '') or ''
+                body.append([month_label, campaign, adset, keyword,
                              round(cost), round(gmv), signal])
 
-    # 보존 대상 행 (refresh 대상이 아니면서 BACKFILL_FROM 이상인 기존 행만)
-    preserved = []
-    if existing and len(existing) > 1:
-        for r in existing[1:]:
-            if r and r[0] and r[0] not in refresh_months and r[0] >= BACKFILL_FROM:
-                preserved.append(r)
+        # 광고비 내림차순
+        def _cost(r):
+            try:    return float(r[5])
+            except: return 0
+        body.sort(key=_cost, reverse=True)
 
-    all_rows = preserved + new_rows
-    def _cost(r):
-        try:    return float(r[5]) if len(r) > 5 else 0
-        except: return 0
-    all_rows.sort(key=lambda r: (r[0], _cost(r)), reverse=True)
+        try:    ws = wb_agency.worksheet(tab_name)
+        except: ws = wb_agency.add_worksheet(tab_name, rows=2000, cols=cols)
 
-    final = [ag_headers] + all_rows
-    ws.clear()
-    ws.update(final, 'A1')
-    ws.resize(cols=resize_cols)
-    ws.update(LEGEND, legend_col)
-    print(f'  {tab_name} 완료 - 갱신 {len(new_rows)}행 / 보존 {len(preserved)}행 (refresh: {sorted(refresh_months)})')
+        final = [ag_headers] + body
+        ws.clear()
+        ws.update(final, 'A1')
+        ws.resize(cols=resize_cols)
+        ws.update(LEGEND, legend_col)
+        print(f'  {tab_name} 완료 - {len(body)}행')
 
 # ── 메인 ───────────────────────────────────────────
 def main():
