@@ -102,14 +102,15 @@ WITH naver AS (
     GROUP BY 1,2,3,4,5,6,7
 ),
 cm AS (
-    SELECT resve_id, SUM(CON_MARGIN) AS CON_MARGIN
+    SELECT resve_id, SUM(CM) AS CM
     FROM `mrtdata.edw_fpna.MART_FPNA_NONAIR_PROFIT_D`
+    WHERE RECENT_STATUS IN ('confirm', 'finish')
     GROUP BY 1
 ),
 purchase AS (
     SELECT ms.BASIS_DATE, RESVE_N_KEYWORD_ID AS n_keyword_id,
         SUM(ms.SALES_KRW_PRICE) AS gmv,
-        SUM(c.CON_MARGIN) AS con_margin
+        SUM(c.CM) AS con_margin
     FROM `mrtdata.edw_mart.MART_SALE_D` AS ms
     LEFT JOIN cm AS c ON ms.RESVE_ID = c.resve_id
     WHERE ms.BASIS_DATE BETWEEN '{start_date}' AND '{end_date}'
@@ -147,14 +148,15 @@ str AS (
     FROM `mrtdata.edw.DW_ADS_STAT_NAVER_MASTER_REPORT_SHOPPING_PRODUCT_AD`
 ),
 cm AS (
-    SELECT resve_id, SUM(CON_MARGIN) AS CON_MARGIN
+    SELECT resve_id, SUM(CM) AS CM
     FROM `mrtdata.edw_fpna.MART_FPNA_NONAIR_PROFIT_D`
+    WHERE RECENT_STATUS IN ('confirm', 'finish')
     GROUP BY 1
 ),
 purchase AS (
     SELECT ms.BASIS_DATE, RESVE_N_AD AS n_ad,
         SUM(ms.SALES_KRW_PRICE) AS gmv,
-        SUM(c.CON_MARGIN) AS con_margin
+        SUM(c.CM) AS con_margin
     FROM `mrtdata.edw_mart.MART_SALE_D` AS ms
     LEFT JOIN cm AS c ON ms.RESVE_ID = c.resve_id
     WHERE ms.BASIS_DATE BETWEEN '{start_date}' AND '{end_date}'
@@ -241,6 +243,7 @@ def write_chunks(ws, data, chunk=2000):
         return v
     safe_data = [[safe(c) for c in row] for row in data]
     ws.clear()
+    ws.resize(rows=max(len(safe_data) + 500, 1000))
     for i in range(0, len(safe_data), chunk):
         for attempt in range(5):
             try:
