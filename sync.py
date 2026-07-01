@@ -5,10 +5,12 @@ import json
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 # ── ✏️ 여기만 수정하세요 ───────────────────────────
 SHEET_ID        = '1GeQctImT_N_C_BZ1cOOcy0T5Dg3zEIgf_p5i8B1WqqU'   # 내부용 구글 시트 ID
 SHEET_ID_AGENCY = '18lc2b5XH1qCxSyzE_KkaFUPyjwYooLyOlDsfq0nEzs4'   # 대행사용 구글 시트 ID
+SHEET_ID_SCORE  = '1lTtCtgLRjpMV8ID4LSL7lp5s63m2GswHpYF1GMrqboE'   # CM 점수 대행사 공유 시트
 BQ_PROJECT      = 'mrtdata'                                           # BigQuery 프로젝트 ID
 # ─────────────────────────────────────────────────
 
@@ -208,6 +210,15 @@ def get_signal(cm_roas):
     if cm_roas >= 50:  return '🟡'
     return '🔴'
 
+def get_score(cm_roas):
+    if cm_roas <= 0:   return 0
+    if cm_roas < 50:   return round(cm_roas / 50 * 24)
+    if cm_roas < 75:   return round(25 + (cm_roas - 50) / 25 * 12)
+    if cm_roas < 100:  return round(38 + (cm_roas - 75) / 25 * 11)
+    if cm_roas < 110:  return round(50 + (cm_roas - 100) / 10 * 4)
+    if cm_roas < 220:  return min(99, round(55 + (cm_roas - 110) / 110 * 45))
+    return 100
+
 # ── adset_name 파싱 ────────────────────────────────
 def parse_adset(adset_name, campaign_name):
     parts   = (adset_name or '').split('_')
@@ -261,10 +272,18 @@ LEGEND = [['신호', '의미'],
           ['🟡', '성과 미달'],
           ['🔴', '성과 매우 저조 + 즉각 하향 조정 필요']]
 
+SCORE_LEGEND = [['점수', '구간 / 액션'],
+                ['55–100', '확대 및 점유 극대화'],
+                ['50–54',  '관찰 유지 (BEP 근접)'],
+                ['38–49',  '단계적 하향 검토'],
+                ['25–37',  '하향 조정'],
+                ['0–24',   '즉각 하향 조정']]
+
 # ── 시트 업데이트 ──────────────────────────────────
 def update_sheet(gc, sheet_base, rows, ad_name_field, include_product=False):
     wb        = gc.open_by_key(SHEET_ID)
     wb_agency = gc.open_by_key(SHEET_ID_AGENCY)
+    wb_score  = gc.open_by_key(SHEET_ID_SCORE)
 
     cols_in = 11 if include_product else 10
     cols_ag = 8  if include_product else 7
@@ -275,15 +294,19 @@ def update_sheet(gc, sheet_base, rows, ad_name_field, include_product=False):
     except: ws_ag = wb.add_worksheet(sheet_base, rows=5000, cols=cols_ag)
     try:    ws_ag2 = wb_agency.worksheet(sheet_base)
     except: ws_ag2 = wb_agency.add_worksheet(sheet_base, rows=5000, cols=cols_ag)
+    try:    ws_sc = wb_score.worksheet(sheet_base + '_데일리')
+    except: ws_sc = wb_score.add_worksheet(sheet_base + '_데일리', rows=5000, cols=cols_ag)
 
     if include_product:
         in_headers = ['날짜', '캠페인명', '그룹명', '상품ID', '상품명', '광고비', 'GMV', '공헌이익', 'CM ROAS(%)', '신호', 'CM 결과']
         ag_headers = ['날짜', '캠페인명', '그룹명', '상품ID', '상품명', '광고비', 'GMV', '신호']
+        sc_headers = ['날짜', '캠페인명', '그룹명', '상품ID', '상품명', '광고비', 'GMV', '점수']
     else:
         in_headers = ['날짜', '캠페인명', '그룹명', '키워드', '광고비', 'GMV', '공헌이익', 'CM ROAS(%)', '신호', 'CM 결과']
         ag_headers = ['날짜', '캠페인명', '그룹명', '키워드', '광고비', 'GMV', '신호']
+        sc_headers = ['날짜', '캠페인명', '그룹명', '키워드', '광고비', 'GMV', '점수']
 
-    in_data, ag_data = [in_headers], [ag_headers]
+    in_data, ag_data, sc_data = [in_headers], [ag_headers], [sc_headers]
 
     for row in rows:
         adset      = row.get(ad_name_field, '') or ''
@@ -294,6 +317,7 @@ def update_sheet(gc, sheet_base, rows, ad_name_field, include_product=False):
         cm_roas    = round(con_margin / cost * 100, 1) if cost > 0 else 0
         signal     = get_signal(cm_roas)
         cm_result  = get_cm_result(cm_roas)
+        score      = get_score(cm_roas)
         basis_dt   = str(row.get('basis_dt', ''))[:10]
 
         if include_product:
@@ -303,26 +327,34 @@ def update_sheet(gc, sheet_base, rows, ad_name_field, include_product=False):
                             round(cost), round(gmv), round(con_margin), cm_roas, signal, cm_result])
             ag_data.append([basis_dt, campaign, adset, product_id, product_name,
                             round(cost), round(gmv), signal])
+            sc_data.append([basis_dt, campaign, adset, product_id, product_name,
+                            round(cost), round(gmv), score])
         else:
             keyword = row.get('ad_name', '') or ''
             in_data.append([basis_dt, campaign, adset, keyword,
                             round(cost), round(gmv), round(con_margin), cm_roas, signal, cm_result])
             ag_data.append([basis_dt, campaign, adset, keyword,
                             round(cost), round(gmv), signal])
+            sc_data.append([basis_dt, campaign, adset, keyword,
+                            round(cost), round(gmv), score])
 
     write_chunks(ws_in, in_data)
     write_chunks(ws_ag, ag_data)
     write_chunks(ws_ag2, ag_data)
+    write_chunks(ws_sc, sc_data)
 
-    legend_col  = 'J1' if include_product else 'I1'
-    resize_cols = 11  if include_product else 10
-    ws_ag2.resize(cols=resize_cols)
-    ws_ag2.update(LEGEND, legend_col)
+    legend_col  = 'I1' if include_product else 'H1'
+    resize_cols = 10  if include_product else 9
+    ws_ag2.resize(cols=11 if include_product else 10)
+    ws_ag2.update(LEGEND, 'J1' if include_product else 'I1')
+    ws_sc.resize(cols=resize_cols)
+    ws_sc.update(SCORE_LEGEND, legend_col)
     print(f'  {sheet_base} 완료 - {len(rows)}행')
 
 # ── 주차별 시트 업데이트 (대행사용) ───────────────────
 def update_weekly_sheet(gc, sheet_base, rows, ad_name_field, include_product=False):
     wb_agency = gc.open_by_key(SHEET_ID_AGENCY)
+    wb_score  = gc.open_by_key(SHEET_ID_SCORE)
 
     weekly = {}
     for row in rows:
@@ -348,25 +380,32 @@ def update_weekly_sheet(gc, sheet_base, rows, ad_name_field, include_product=Fal
 
     if include_product:
         ag_headers = ['주차', '캠페인명', '그룹명', '상품ID', '상품명', '광고비', 'GMV', '신호']
+        sc_headers = ['주차', '캠페인명', '그룹명', '상품ID', '상품명', '광고비', 'GMV', '점수']
     else:
         ag_headers = ['주차', '캠페인명', '그룹명', '키워드', '광고비', 'GMV', '신호']
+        sc_headers = ['주차', '캠페인명', '그룹명', '키워드', '광고비', 'GMV', '점수']
 
-    ag_data = [ag_headers]
+    ag_data, sc_data = [ag_headers], [sc_headers]
     for key in sorted(weekly.keys(), reverse=True):
         v          = weekly[key]
         cost       = v['cost']
         con_margin = v['con_margin']
         cm_roas    = round(con_margin / cost * 100, 1) if cost > 0 else 0
         signal     = get_signal(cm_roas)
+        score      = get_score(cm_roas)
 
         if include_product:
             week_label, campaign, adset, product_id, product_name = key
             ag_data.append([week_label, campaign, adset, product_id, product_name,
                             round(cost), round(v['gmv']), signal])
+            sc_data.append([week_label, campaign, adset, product_id, product_name,
+                            round(cost), round(v['gmv']), score])
         else:
             week_label, campaign, adset, keyword = key
             ag_data.append([week_label, campaign, adset, keyword,
                             round(cost), round(v['gmv']), signal])
+            sc_data.append([week_label, campaign, adset, keyword,
+                            round(cost), round(v['gmv']), score])
 
     tab_name    = sheet_base + '_주차별 CM 성과'
     legend_col  = 'J1' if include_product else 'I1'
@@ -374,14 +413,62 @@ def update_weekly_sheet(gc, sheet_base, rows, ad_name_field, include_product=Fal
 
     try:    ws = wb_agency.worksheet(tab_name)
     except: ws = wb_agency.add_worksheet(tab_name, rows=2000, cols=9)
+    try:    ws_sc = wb_score.worksheet(tab_name)
+    except: ws_sc = wb_score.add_worksheet(tab_name, rows=2000, cols=9)
 
     ws.clear()
     ws.update(ag_data, 'A1')
     ws.resize(cols=resize_cols)
     ws.update(LEGEND, legend_col)
+
+    ws_sc.clear()
+    ws_sc.update(sc_data, 'A1')
+    ws_sc.resize(cols=resize_cols)
+    ws_sc.update(SCORE_LEGEND, legend_col)
     print(f'  {tab_name} 완료 - {len(ag_data)-1}행')
 
 # ── 메인 ───────────────────────────────────────────
+def update_city_weekly_score(gc, rows_pl, rows_sh):
+    wb_score = gc.open_by_key(SHEET_ID_SCORE)
+
+    def build(rows, adset_key):
+        grouped = defaultdict(lambda: {'cost': 0, 'gmv': 0, 'cm': 0})
+        for row in rows:
+            adset    = row.get(adset_key, '') or ''
+            campaign = row.get('campaign_name', '') or ''
+            cost     = float(row.get('cost', 0) or 0)
+            gmv      = float(row.get('gmv',  0) or 0)
+            cm       = float(row.get('con_margin', 0) or 0)
+            week     = get_week_label(str(row.get('basis_dt', ''))[:10])
+            country, city, _ = parse_adset(adset, campaign)
+            if not country:
+                continue
+            k = (week, country, city)
+            grouped[k]['cost'] += cost
+            grouped[k]['gmv']  += gmv
+            grouped[k]['cm']   += cm
+        data = [['주차', '국가', '도시', '광고비', 'GMV', '점수']]
+        for k in sorted(grouped.keys(), reverse=True):
+            v    = grouped[k]
+            cost = v['cost']
+            cm_roas = round(v['cm'] / cost * 100, 1) if cost > 0 else 0
+            data.append([k[0], k[1], k[2], round(cost), round(v['gmv']), get_score(cm_roas)])
+        return data
+
+    for sheet_base, rows, key in [
+        ('파워링크', rows_pl, 'adset_name'),
+        ('쇼검광',   rows_sh, 'adgroup_name'),
+    ]:
+        tab = sheet_base + '_국가도시_주차별 점수'
+        try:    ws = wb_score.worksheet(tab)
+        except: ws = wb_score.add_worksheet(tab, rows=5000, cols=8)
+        data = build(rows, key)
+        write_chunks(ws, data)
+        ws.resize(cols=8)
+        ws.update(SCORE_LEGEND, 'G1')
+        print(f'  {tab} 완료 - {len(data)-1}행')
+
+
 def main():
     today      = datetime.today()
     start_date = (today - timedelta(days=90)).strftime('%Y-%m-%d')
@@ -407,6 +494,7 @@ def main():
 
     update_sheet(gc, '쇼검광', rows_sh, 'adgroup_name', include_product=True)
     update_weekly_sheet(gc, '쇼검광', rows_sh, 'adgroup_name', include_product=True)
+    update_city_weekly_score(gc, rows_pl, rows_sh)
     # 월별 CM 성과 탭은 monthly_sync.py가 별도로 담당
 
     print('전체 완료:', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))

@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 
 # ── ✏️ 여기만 수정하세요 ───────────────────────────
 SHEET_ID_AGENCY = '18lc2b5XH1qCxSyzE_KkaFUPyjwYooLyOlDsfq0nEzs4'
+SHEET_ID_SCORE  = '1lTtCtgLRjpMV8ID4LSL7lp5s63m2GswHpYF1GMrqboE'
 BQ_PROJECT      = 'mrtdata'
 LOOKBACK_DAYS   = 90        # BQ 조회 윈도우
 BACKFILL_FROM   = '2026-03' # 이 월 이전 데이터는 시트에 보이지 않게 (백필/보존 모두 제외)
@@ -209,11 +210,27 @@ def get_signal(cm_roas):
     if cm_roas >= 50:  return '🟡'
     return '🔴'
 
+def get_score(cm_roas):
+    if cm_roas <= 0:   return 0
+    if cm_roas < 50:   return round(cm_roas / 50 * 24)
+    if cm_roas < 75:   return round(25 + (cm_roas - 50) / 25 * 12)
+    if cm_roas < 100:  return round(38 + (cm_roas - 75) / 25 * 11)
+    if cm_roas < 110:  return round(50 + (cm_roas - 100) / 10 * 4)
+    if cm_roas < 220:  return min(99, round(55 + (cm_roas - 110) / 110 * 45))
+    return 100
+
 LEGEND = [['신호', '의미'],
           ['🟢', '성과 매우 우수 + 상향 조정 등 적극 액션 필요'],
           ['🔵', '성과 준수 + 상향 조정'],
           ['🟡', '성과 미달'],
           ['🔴', '성과 매우 저조 + 즉각 하향 조정 필요']]
+
+SCORE_LEGEND = [['점수', '구간 / 액션'],
+                ['55–100', '확대 및 점유 극대화'],
+                ['50–54',  '관찰 유지 (BEP 근접)'],
+                ['38–49',  '단계적 하향 검토'],
+                ['25–37',  '하향 조정'],
+                ['0–24',   '즉각 하향 조정']]
 
 # ── 시트 업데이트 (월별 분리 탭, 멱등) ─────────────
 def update_monthly_sheet(gc, sheet_base, rows, start_date, include_product=False):
@@ -226,6 +243,7 @@ def update_monthly_sheet(gc, sheet_base, rows, start_date, include_product=False
     - 레거시 통합 탭({sheet_base}_월별 CM 성과)은 자동 삭제.
     """
     wb_agency = gc.open_by_key(SHEET_ID_AGENCY)
+    wb_score  = gc.open_by_key(SHEET_ID_SCORE)
 
     # 레거시 통합 탭 삭제 (최초 1회 효과)
     legacy_tab = sheet_base + '_월별 CM 성과'
@@ -242,8 +260,10 @@ def update_monthly_sheet(gc, sheet_base, rows, start_date, include_product=False
 
     if include_product:
         ag_headers = ['월', '캠페인명', '그룹명', '상품ID', '상품명', '광고비', 'GMV', '신호']
+        sc_headers = ['월', '캠페인명', '그룹명', '상품ID', '상품명', '광고비', 'GMV', '점수']
     else:
         ag_headers = ['월', '캠페인명', '그룹명', '키워드', '광고비', 'GMV', '신호']
+        sc_headers = ['월', '캠페인명', '그룹명', '키워드', '광고비', 'GMV', '점수']
 
     cols        = 8 if include_product else 7
     legend_col  = 'J1' if include_product else 'I1'
@@ -263,13 +283,14 @@ def update_monthly_sheet(gc, sheet_base, rows, start_date, include_product=False
         m_num    = int(month_label.split('-')[1])
         tab_name = f'{sheet_base}_월별 성과_{m_num}월'
 
-        body = []
+        body, sc_body = [], []
         for row in by_month[month_label]:
             cost       = float(row.get('cost', 0) or 0)
             gmv        = float(row.get('gmv',  0) or 0)
             con_margin = float(row.get('con_margin', 0) or 0)
             cm_roas    = round(con_margin / cost * 100, 1) if cost > 0 else 0
             signal     = get_signal(cm_roas)
+            score      = get_score(cm_roas)
             campaign   = row.get('campaign_name', '') or ''
 
             if include_product:
@@ -278,26 +299,40 @@ def update_monthly_sheet(gc, sheet_base, rows, start_date, include_product=False
                 product_name = row.get('product_name', '') or ''
                 body.append([month_label, campaign, adset, product_id, product_name,
                              round(cost), round(gmv), signal])
+                sc_body.append([month_label, campaign, adset, product_id, product_name,
+                                round(cost), round(gmv), score])
             else:
                 adset   = row.get('adset_name', '') or ''
                 keyword = row.get('ad_name', '') or ''
                 body.append([month_label, campaign, adset, keyword,
                              round(cost), round(gmv), signal])
+                sc_body.append([month_label, campaign, adset, keyword,
+                                round(cost), round(gmv), score])
 
         # 광고비 내림차순
         def _cost(r):
             try:    return float(r[5])
             except: return 0
         body.sort(key=_cost, reverse=True)
+        sc_body.sort(key=_cost, reverse=True)
 
         try:    ws = wb_agency.worksheet(tab_name)
         except: ws = wb_agency.add_worksheet(tab_name, rows=2000, cols=cols)
+        sc_tab_name = f'{sheet_base}_{m_num}월 누적'
+        try:    ws_sc = wb_score.worksheet(sc_tab_name)
+        except: ws_sc = wb_score.add_worksheet(sc_tab_name, rows=2000, cols=cols)
 
         final = [ag_headers] + body
         ws.clear()
         ws.update(final, 'A1')
         ws.resize(cols=resize_cols)
         ws.update(LEGEND, legend_col)
+
+        sc_final = [sc_headers] + sc_body
+        ws_sc.clear()
+        ws_sc.update(sc_final, 'A1')
+        ws_sc.resize(cols=resize_cols)
+        ws_sc.update(SCORE_LEGEND, legend_col)
         print(f'  {tab_name} 완료 - {len(body)}행')
 
 # ── 메인 ───────────────────────────────────────────
