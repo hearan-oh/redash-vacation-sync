@@ -348,7 +348,6 @@ def update_sheet(gc, sheet_base, rows, ad_name_field, include_product=False):
     ws_ag2.resize(cols=11 if include_product else 10)
     ws_ag2.update(LEGEND, 'J1' if include_product else 'I1')
     ws_sc.resize(cols=resize_cols)
-    ws_sc.update(SCORE_LEGEND, legend_col)
     print(f'  {sheet_base} 완료 - {len(rows)}행')
 
 # ── 주차별 시트 업데이트 (대행사용) ───────────────────
@@ -424,7 +423,6 @@ def update_weekly_sheet(gc, sheet_base, rows, ad_name_field, include_product=Fal
     ws_sc.clear()
     ws_sc.update(sc_data, 'A1')
     ws_sc.resize(cols=resize_cols)
-    ws_sc.update(SCORE_LEGEND, legend_col)
     print(f'  {tab_name} 완료 - {len(ag_data)-1}행')
 
 # ── 메인 ───────────────────────────────────────────
@@ -465,7 +463,6 @@ def update_city_weekly_score(gc, rows_pl, rows_sh):
         data = build(rows, key)
         write_chunks(ws, data)
         ws.resize(cols=8)
-        ws.update(SCORE_LEGEND, 'G1')
         print(f'  {tab} 완료 - {len(data)-1}행')
 
 

@@ -332,7 +332,6 @@ def update_monthly_sheet(gc, sheet_base, rows, start_date, include_product=False
         ws_sc.clear()
         ws_sc.update(sc_final, 'A1')
         ws_sc.resize(cols=resize_cols)
-        ws_sc.update(SCORE_LEGEND, legend_col)
         print(f'  {tab_name} 완료 - {len(body)}행')
 
 # ── 메인 ───────────────────────────────────────────
