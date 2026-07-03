@@ -426,10 +426,12 @@ def update_weekly_sheet(gc, sheet_base, rows, ad_name_field, include_product=Fal
     print(f'  {tab_name} 완료 - {len(ag_data)-1}행')
 
 # ── 메인 ───────────────────────────────────────────
-def update_city_weekly_score(gc, rows_pl, rows_sh):
-    wb_score = gc.open_by_key(SHEET_ID_SCORE)
+def update_city_weekly(gc, rows_pl, rows_sh):
+    """국가도시_주차별 탭: 대행사 신호 시트엔 신호(🔴🟡🔵🟢), 점수 시트엔 점수(0~100)."""
+    wb_agency = gc.open_by_key(SHEET_ID_AGENCY)
+    wb_score  = gc.open_by_key(SHEET_ID_SCORE)
 
-    def build(rows, adset_key):
+    def group(rows, adset_key):
         grouped = defaultdict(lambda: {'cost': 0, 'gmv': 0, 'cm': 0})
         for row in rows:
             adset    = row.get(adset_key, '') or ''
@@ -445,25 +447,38 @@ def update_city_weekly_score(gc, rows_pl, rows_sh):
             grouped[k]['cost'] += cost
             grouped[k]['gmv']  += gmv
             grouped[k]['cm']   += cm
-        data = [['주차', '국가', '도시', '광고비', 'GMV', '점수']]
-        for k in sorted(grouped.keys(), reverse=True):
-            v    = grouped[k]
-            cost = v['cost']
-            cm_roas = round(v['cm'] / cost * 100, 1) if cost > 0 else 0
-            data.append([k[0], k[1], k[2], round(cost), round(v['gmv']), get_score(cm_roas)])
-        return data
+        return grouped
 
     for sheet_base, rows, key in [
         ('파워링크', rows_pl, 'adset_name'),
         ('쇼검광',   rows_sh, 'adgroup_name'),
     ]:
-        tab = sheet_base + '_국가도시_주차별 점수'
-        try:    ws = wb_score.worksheet(tab)
-        except: ws = wb_score.add_worksheet(tab, rows=5000, cols=8)
-        data = build(rows, key)
-        write_chunks(ws, data)
-        ws.resize(cols=8)
-        print(f'  {tab} 완료 - {len(data)-1}행')
+        grouped = group(rows, key)
+        keys_sorted = sorted(grouped.keys(), reverse=True)
+
+        sig_data = [['주차', '국가', '도시', '광고비', 'GMV', '신호']]
+        sc_data  = [['주차', '국가', '도시', '광고비', 'GMV', '점수']]
+        for k in keys_sorted:
+            v       = grouped[k]
+            cost    = v['cost']
+            cm_roas = round(v['cm'] / cost * 100, 1) if cost > 0 else 0
+            sig_data.append([k[0], k[1], k[2], round(cost), round(v['gmv']), get_signal(cm_roas)])
+            sc_data.append([k[0], k[1], k[2], round(cost), round(v['gmv']), get_score(cm_roas)])
+
+        sig_tab = sheet_base + '_국가도시_주차별 신호'
+        try:    ws_sig = wb_agency.worksheet(sig_tab)
+        except: ws_sig = wb_agency.add_worksheet(sig_tab, rows=5000, cols=8)
+        write_chunks(ws_sig, sig_data)
+        ws_sig.resize(cols=8)
+        ws_sig.update(LEGEND, 'H1')
+        print(f'  {sig_tab} 완료 - {len(sig_data)-1}행')
+
+        sc_tab = sheet_base + '_국가도시_주차별 점수'
+        try:    ws_sc = wb_score.worksheet(sc_tab)
+        except: ws_sc = wb_score.add_worksheet(sc_tab, rows=5000, cols=8)
+        write_chunks(ws_sc, sc_data)
+        ws_sc.resize(cols=8)
+        print(f'  {sc_tab} 완료 - {len(sc_data)-1}행')
 
 
 def main():
@@ -491,7 +506,7 @@ def main():
 
     update_sheet(gc, '쇼검광', rows_sh, 'adgroup_name', include_product=True)
     update_weekly_sheet(gc, '쇼검광', rows_sh, 'adgroup_name', include_product=True)
-    update_city_weekly_score(gc, rows_pl, rows_sh)
+    update_city_weekly(gc, rows_pl, rows_sh)
     # 월별 CM 성과 탭은 monthly_sync.py가 별도로 담당
 
     print('전체 완료:', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
